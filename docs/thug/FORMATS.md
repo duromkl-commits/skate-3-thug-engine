@@ -173,5 +173,17 @@ TerrainType...) belong to the node. On NJ: 1783 RailNode, 167 ClimbingNode
 - Face flags on PC: almost every face carries 0x2000; 0x1 (skatable) is unused.
 - Ladders and ledge hang points (ClimbingNode) aren't exported yet.
 - Spawn heading is the restart's yaw negated for the Z flip; check in-game.
-- Baked vertex colours → `.skate` has an indirect/lightmap texture slot. For the
-  first pass, bake vertex colour into albedo or skip it. Plan to re-light later.
+- Baked vertex colours are written as a lightmap: one 2x2 texel cell per triangle
+  (A, B, C, B+C−A), lightmap UVs at the texel centres, values stored as
+  sqrt(colour/128) because the world shader squares the lightmap.
+- Blending: portable `.skate` materials output alpha 1 even when `alpha_mode` is 2,
+  so THUG BLEND passes are exported as alpha cutouts and add/subtract/modulate
+  passes are dropped. Proper blending needs SKATE12 retail material definitions
+  (family 7 reads texture alpha), which also switch the engine into its retail
+  scene mode; not tried yet.
+- Visibility: only nodes with `CreatedAtStart` are exported; ProximNode,
+  EmitterObject, GameObject and `Occlusion*` objects are dropped (NJ: 330 of 1700
+  collision objects). Power-line rails (GRINDELECTRICWIRE/GRINDWIRE) are dropped
+  unless `--keep-wires`.
+- Sky: `levels/<l>_sky/<l>_sky.scn.xbx` is exported as a static dome scaled to a
+  650 m radius around the level centre (the engine's own sky is a flat clear colour).

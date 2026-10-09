@@ -1,12 +1,14 @@
 """Convert a Tony Hawk's Underground PC level into a `.skate` map (SKATE09).
 
-usage: python thug_to_skate.py <THUG Game folder> <level, e.g. NJ> <out.skate>
+usage: python thug_to_skate.py <THUG Game folder> <level, e.g. NJ> <out.skate> [--keep-wires]
 
 Reads Data/pre/<level>scn.pre and <level>col.pre from your own THUG PC install.
 and <level>.pre (the level's node array). What carries over: render geometry (pass 0
 texture), textures, collision with THUG terrain types mapped to Skate 3 audio surfaces,
-rails (RailNode chains) and the Player1 restart as the spawn. Not yet: ladders, ledges,
-baked vertex lighting, multi-pass blending. See docs/thug/FORMATS.md.
+rails (RailNode chains), the Player1 restart as the spawn, THUG's baked vertex lighting
+(as a lightmap) and the level's sky dome. Objects that are hidden at level start, trigger
+volumes and power-line rails are left out. Not yet: ladders, ledges, multi-pass blending.
+See docs/thug/FORMATS.md.
 """
 import math
 import pathlib
@@ -43,6 +45,19 @@ TERRAIN_WATER = 24
 PHYSICS_GROUND, PHYSICS_WATER = 1, 12
 
 FACE_NON_COLLIDABLE, FACE_TRIGGER = 0x10, 0x40
+
+# THUG pass-0 blend modes (Gfx/XBox/NX/render.h). The engine's portable materials can't
+# alpha-blend (blended output is opaque), so BLEND becomes an alpha cutout. Additive,
+# subtractive and modulating passes have no equivalent and are dropped rather than drawn
+# as opaque black or white quads.
+BLEND_DIFFUSE, BLEND_BLEND, BLEND_BLEND_FIXED = 0, 5, 6
+DROPPED_BLENDS = {1, 2, 3, 4, 7, 8, 9, 10, 12, 13, 15}
+BLEND_CUTOFF = 0.5
+
+# The THUG sky dome is drawn around the camera; here it is static, so scale it up around
+# the level's centre. Bevy's default far plane is 1000 m.
+SKY_RADIUS = 650.0
+LIGHTMAP_WIDTH = 2048
 
 
 def surface_tag(terrain: int) -> int:
@@ -149,6 +164,75 @@ def normalize(n):
     return (n[0] / length, n[1] / length, n[2] / length)
 
 
+# ---- baked lighting -------------------------------------------------------------------------
+
+class Lightmap:
+    """THUG lights levels with per-vertex colours (0x80 = full brightness); `.skate` has no
+    vertex colour, only a lightmap. Each triangle gets its own 2x2 texel cell holding
+    A, B, C and B+C-A at the corners, with lightmap UVs at the first three texel centres:
+    bilinear filtering then reproduces the linear colour gradient across the triangle.
+    The shader squares the lightmap, so values are stored as sqrt."""
+
+    def __init__(self, width: int):
+        self.width = width
+        self.cells = []
+
+    @property
+    def height(self):
+        rows = -(-max(1, len(self.cells)) // (self.width // 2))
+        return max(4, -(-rows * 2 // 4) * 4)
+
+    def add(self, argb):
+        cell = len(self.cells)
+        self.cells.append(argb)
+        x = (cell % (self.width // 2)) * 2
+        y = (cell // (self.width // 2)) * 2
+        return [((x + dx + 0.5), (y + dy + 0.5)) for dx, dy in ((0, 0), (1, 0), (0, 1))]
+
+    def rgba(self) -> bytes:
+        w, h = self.width, self.height
+        img = np.zeros((h, w, 3), np.float32)
+        if self.cells:
+            c = np.array(self.cells, np.uint32)                                   # (n, 3)
+            rgb = np.stack([(c >> 16) & 255, (c >> 8) & 255, c & 255], -1) / 128.0  # (n, 3, 3)
+            a, b, cc = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+            quad = np.stack([np.stack([a, b], 1), np.stack([cc, b + cc - a], 1)], 1)  # (n, 2, 2, 3)
+            n = len(self.cells)
+            cols = w // 2
+            grid = np.zeros((-(-n // cols) * cols, 2, 2, 3), np.float32)
+            grid[:n] = quad
+            grid = grid.reshape(-1, cols, 2, 2, 3).transpose(0, 2, 1, 3, 4).reshape(-1, w, 3)
+            img[:len(grid)] = grid
+        out = np.full((h, w, 4), 255, np.uint8)
+        out[:, :, :3] = np.round(np.sqrt(np.clip(img, 0, 1)) * 255)
+        return out.tobytes()
+
+
+
+# ---- level visibility -----------------------------------------------------------------------
+
+CREATED_AT_START = crc("CreatedAtStart")
+NOT_GEOMETRY = {crc(n) for n in ("ProximNode", "EmitterObject", "GameObject")}
+
+
+def visible_objects(nodes, names):
+    """Checksums of scene sectors / collision objects that exist when the level starts, or
+    None when the level has no node array. Everything without a node, every object not
+    CreatedAtStart (goal props, story-state geometry), trigger volumes (ProximNode),
+    sound emitters and occlusion volumes is left out."""
+    if not nodes:
+        return None
+    keep = set()
+    for n in nodes:
+        name = n.get(NAME)
+        if name is None or not n.get(CREATED_AT_START) or n.get(CLASS) in NOT_GEOMETRY:
+            continue
+        if names.get(name, "").lower().startswith("occlusion"):
+            continue
+        keep.add(name)
+    return keep
+
+
 # ---- writer ---------------------------------------------------------------------------------
 
 class Out:
@@ -181,7 +265,7 @@ ENVIRONMENT = [
 ]
 
 
-def convert(game_dir: pathlib.Path, level: str, out_path: pathlib.Path):
+def convert(game_dir: pathlib.Path, level: str, out_path: pathlib.Path, keep_wires=False):
     pre_dir = game_dir / "Data" / "pre"
     files = read_pre(pre_dir / f"{level}scn.pre")
     files.update(read_pre(pre_dir / f"{level}col.pre"))
@@ -196,55 +280,92 @@ def convert(game_dir: pathlib.Path, level: str, out_path: pathlib.Path):
     for t in textures:
         rgba = decode_texture(t)
         tex_id[t.checksum] = len(tex_rgba) + 1
-        tex_rgba.append((f"{t.checksum:08x}", t.width, t.height, rgba))
+        tex_rgba.append((f"{t.checksum:08x}", t.width, t.height, 1, rgba))
         tex_alpha[t.checksum] = texture_has_alpha(rgba)
 
     # Materials: one per THUG material, pass 0 only. Id 1 is a fallback for collision.
+    # Every material but the collision one uses the baked vertex lighting (written as the
+    # last texture) as its lightmap.
     mat_id = {}
-    mat_rows = [("thug_collision", 0, 0, 0)]
+    mat_rows = [("thug_collision", 0, False, 0, 0.5)]
     for m in materials:
         p0 = m.passes[0] if m.passes else None
+        blend = p0.blend & 0xFF if p0 else BLEND_DIFFUSE
+        if blend in DROPPED_BLENDS:
+            continue
         texture = tex_id.get(p0.texture, 0) if p0 else 0
-        if p0 and p0.blend & 0xFF:
-            alpha_mode = 2
-        elif p0 and tex_alpha.get(p0.texture):
-            alpha_mode = 1
+        if blend in (BLEND_BLEND, BLEND_BLEND_FIXED) or tex_alpha.get(p0.texture if p0 else 0):
+            alpha_mode, cutoff = 1, max(m.alpha_cutoff / 255.0, BLEND_CUTOFF if blend else 0.0) or BLEND_CUTOFF
         else:
-            alpha_mode = 0
+            alpha_mode, cutoff = 0, 0.5
         mat_id[m.checksum] = len(mat_rows) + 1
-        mat_rows.append((f"{m.checksum:08x}", texture, alpha_mode, m.alpha_cutoff / 255.0))
+        mat_rows.append((f"{m.checksum:08x}", texture, True, alpha_mode, cutoff))
 
-    # Render geometry: unshared vertices per mesh so no triangle mixes materials.
+    # Node array: decides which objects exist at level start.
+    nodes, qb_names = [], {}
+    if (pre_dir / f"{level}.pre").exists():
+        level_files = read_pre(pre_dir / f"{level}.pre")
+        if f"{base}.qb" in level_files:
+            globals_, qb_names = read_qb(level_files[f"{base}.qb"])
+            nodes = expand_nodes(globals_.get(crc("NodeArray"), []), globals_)
+    keep = visible_objects(nodes, qb_names) if nodes else None
+
+    # Render geometry: one vertex per triangle corner, so every triangle can own a 2x2
+    # lightmap cell holding its three vertex colours (see `Lightmap`).
+    lightmap = Lightmap(LIGHTMAP_WIDTH)
     verts, indices = [], []
-    for sector in sectors:
+    sky = []
+    if f"levels/{key}_sky/{key}_sky.scn.xbx" in files:
+        sky_mats, sky = thug_level.read_scn(files[f"levels/{key}_sky/{key}_sky.scn.xbx"])
+        sky_tex = thug_level.read_tex(files[f"levels/{key}_sky/{key}_sky.tex.xbx"])
+        for t in sky_tex:
+            if t.checksum not in tex_id:
+                rgba = decode_texture(t)
+                tex_id[t.checksum] = len(tex_rgba) + 1
+                tex_rgba.append((f"{t.checksum:08x}", t.width, t.height, 1, rgba))
+        for m in sky_mats:
+            if m.checksum not in mat_id:
+                p0 = m.passes[0] if m.passes else None
+                mat_id[m.checksum] = len(mat_rows) + 1
+                mat_rows.append((f"sky_{m.checksum:08x}", tex_id.get(p0.texture, 0) if p0 else 0,
+                                 True, 0, 0.5))
+    level_sectors = [x for x in sectors if keep is None or x.checksum in keep]
+    lo = np.min([np.min(x.positions, 0) for x in level_sectors], 0)
+    hi = np.max([np.max(x.positions, 0) for x in level_sectors], 0)
+    centre = (lo + hi) / 2
+    sky_scale = SKY_RADIUS / INCH / max(1.0, max(np.max(np.abs(x.positions)) for x in sky)) if sky else 1.0
+    dropped = 0
+    for sector, is_sky in [(x, False) for x in level_sectors] + [(x, True) for x in sky]:
+        place = ((lambda q: (centre[0] + q[0] * sky_scale, lo[1] + q[1] * sky_scale, centre[2] + q[2] * sky_scale))
+                 if is_sky else (lambda q: q))
         for mesh in sector.meshes:
-            mid = mat_id.get(mesh.material, 1)
-            remap = {}
+            mid = mat_id.get(mesh.material)
+            if mid is None:
+                dropped += 1
+                continue
             for tri in strip_triangles(mesh.indices):
-                pts = []
-                for i in tri:
-                    if i >= len(sector.positions):
-                        break
-                    pts.append(i)
-                if len(pts) != 3:
+                if max(tri) >= len(sector.positions):
                     continue
-                p = [to_skate(sector.positions[i]) for i in pts]
+                pts = list(reversed(tri))  # Z flip mirrors, so reverse winding
+                p = [to_skate(place(sector.positions[i])) for i in pts]
                 if not all(math.isfinite(x) for q in p for x in q):
                     continue
                 if cross(sub(p[1], p[0]), sub(p[2], p[0])) == (0.0, 0.0, 0.0):
                     continue
-                for i in reversed(pts):  # Z flip mirrors, so reverse winding
-                    if i not in remap:
-                        n = finite(sector.normals[i] if sector.normals else (0, 1, 0), (0, 1, 0))
-                        uv = finite(sector.uvs[i][0] if sector.uvs else (0, 0), (0, 0))
-                        remap[i] = len(verts)
-                        verts.append((*to_skate(sector.positions[i]), n[0], n[1], -n[2],
-                                      uv[0], uv[1], 0.0, 0.0, mid))
-                    indices.append(remap[i])
+                colours = [sector.colors[i] if sector.colors else 0xFF808080 for i in pts]
+                lm_uvs = lightmap.add(colours)
+                for k, i in enumerate(pts):
+                    n = finite(sector.normals[i] if sector.normals else (0, 1, 0), (0, 1, 0))
+                    uv = finite(sector.uvs[i][0] if sector.uvs else (0, 0), (0, 0))
+                    indices.append(len(verts))
+                    verts.append((*p[k], n[0], n[1], -n[2], uv[0], uv[1], *lm_uvs[k], mid))
+    tex_rgba.append(("thug_vertex_lighting", lightmap.width, lightmap.height, 0, lightmap.rgba()))
 
     # Collision.
     coll = []
     for obj in collision:
+        if keep is not None and obj.checksum not in keep:
+            continue
         for face in obj.faces:
             if face.flags & (FACE_NON_COLLIDABLE | FACE_TRIGGER):
                 continue
@@ -255,13 +376,7 @@ def convert(game_dir: pathlib.Path, level: str, out_path: pathlib.Path):
                 continue
             coll.append((a, b, c, surface_tag(face.terrain)))
 
-    nodes = []
-    if (pre_dir / f"{level}.pre").exists():
-        level_files = read_pre(pre_dir / f"{level}.pre")
-        if f"{base}.qb" in level_files:
-            globals_, _ = read_qb(level_files[f"{base}.qb"])
-            nodes = expand_nodes(globals_.get(crc("NodeArray"), []), globals_)
-    rails = read_rails(nodes)
+    rails = read_rails(nodes, keep_wires)
     spawn, heading = read_spawn(nodes) or (spawn_guess(coll), 0.0)
 
     out = Out()
@@ -270,22 +385,23 @@ def convert(game_dir: pathlib.Path, level: str, out_path: pathlib.Path):
     out.f(*spawn, heading)
     out.f(*ENVIRONMENT)
     out.u(len(mat_rows), len(tex_rgba), len(verts), len(indices), len(coll), len(rails), 0, 0, 0)
-    for name, texture, alpha_mode, cutoff in mat_rows:
+    for name, texture, lightmap_tex, alpha_mode, cutoff in mat_rows:
         out.s(name)
         out.u(1)
         out.f(.6, .1, 1, 1, 1, .85, 0)       # friction, restitution, colour, roughness, emissive
-        out.u(texture, 0)                     # albedo, indirect
+        out.u(texture, len(tex_rgba) if lightmap_tex else 0)  # albedo, lightmap (last texture)
         out.f(1)                              # indirect strength
         out.u(0, 0, 0, alpha_mode)            # normal, ORM, emissive, alpha mode
         out.f(min(max(cutoff, 0.0), 1.0) or .5)
         out.u(ASPHALT, PHYSICS_GROUND, 0)     # render material audio / physics / pattern
-    for name, w, h, rgba in tex_rgba:
+    for name, w, h, srgb, rgba in tex_rgba:
         out.s(name)
-        out.u(w, h, 1)                        # sRGB
+        out.u(w, h, srgb)
         out.block(rgba)
     vbytes = bytearray()
+    lw, lh = lightmap.width, lightmap.height
     for v in verts:
-        vbytes += struct.pack("<10fI", *v)
+        vbytes += struct.pack("<10fI", *v[:8], v[8] / lw, v[9] / lh, v[10])
     out.block(bytes(vbytes))
     out.block(struct.pack(f"<{len(indices)}I", *indices))
     cbytes = bytearray()
@@ -300,15 +416,23 @@ def convert(game_dir: pathlib.Path, level: str, out_path: pathlib.Path):
     out_path.write_bytes(out.b)
     return dict(textures=len(tex_rgba), materials=len(mat_rows), vertices=len(verts),
                 triangles=len(indices) // 3, collision=len(coll), rails=len(rails),
-                spawn=spawn, heading=heading, bytes=len(out.b))
+                spawn=spawn, heading=heading, bytes=len(out.b), dropped_meshes=dropped,
+                hidden_objects=len(collision) - sum(o.checksum in keep for o in collision) if keep else 0)
 
 
 CLASS, POS, ANGLES, LINKS, NAME, TYPE = (crc(n) for n in ("Class", "Pos", "Angles", "Links", "Name", "Type"))
 
 
-def read_rails(nodes):
-    """RailNode chains (Links point at the next node) -> [(name, closed, points in metres)]."""
-    rail = {i for i, n in enumerate(nodes) if n.get(CLASS) == crc("RailNode") and POS in n}
+WIRE_TERRAINS = {crc("TERRAIN_GRINDELECTRICWIRE"), crc("TERRAIN_GRINDWIRE")}
+
+
+def read_rails(nodes, keep_wires=False):
+    """RailNode chains (Links point at the next node) -> [(name, closed, points in metres)].
+    Power lines are left out unless `keep_wires`: THUG lets you grind them ~6 m up, which
+    Skate 3's jump can't reach. Rails not created at level start are left out too."""
+    rail = {i for i, n in enumerate(nodes)
+            if n.get(CLASS) == crc("RailNode") and POS in n and n.get(CREATED_AT_START)
+            and (keep_wires or n.get(crc("TerrainType")) not in WIRE_TERRAINS)}
     nxt = {}
     for i in rail:
         links = [j for j in nodes[i].get(LINKS, []) if isinstance(j, int) and j in rail]
@@ -358,6 +482,7 @@ def spawn_guess(coll):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
+    args = [a for a in sys.argv[1:] if a != "--keep-wires"]
+    if len(args) != 3:
         sys.exit(__doc__)
-    print(convert(pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])))
+    print(convert(pathlib.Path(args[0]), args[1], pathlib.Path(args[2]), "--keep-wires" in sys.argv))
