@@ -120,8 +120,8 @@ align 4 → face base:
 i32 bsp_size; BSP nodes; face index lists   (not needed, the engine builds its own)
 ```
 Face flags we care about (Gfx/nxflags.h): 0x1 skatable, 0x2 not skatable,
-0x4 wallride, 0x8 vert, 0x10 non-collidable (drop), 0x40 trigger (drop or
-make a trigger volume), 0x1000 invisible.
+0x4 wallride, 0x8 vert, 0x10 non-collidable (drop), 0x40 trigger (fires a script,
+e.g. a gap, but **is still solid**: most quarter pipes carry it), 0x1000 invisible.
 
 ## `.skate` target (crates/skate-data/src/skate_map.rs)
 
@@ -176,6 +176,8 @@ TerrainType...) belong to the node. On NJ: 1783 RailNode, 167 ClimbingNode
 - Baked vertex colours are written as a lightmap: one 2x2 texel cell per triangle
   (A, B, C, B+C−A), lightmap UVs at the texel centres, values stored as
   sqrt(colour/128) because the world shader squares the lightmap.
+- Material passes flagged 0x8 (environment map) are skipped; the first other pass is
+  used. Blended decals with near-black colour (baked shadows) are dropped.
 - Blending: portable `.skate` materials output alpha 1 even when `alpha_mode` is 2,
   so THUG BLEND passes are exported as alpha cutouts and add/subtract/modulate
   passes are dropped. Proper blending needs SKATE12 retail material definitions
@@ -200,4 +202,8 @@ i32 n, u32 bone names[n], u32 parent names[n], u32 flip names[n]`, then per bone
 quaternion (xyzw) and a translation (xyzw) relative to the parent. Quat→matrix is
 `QuatVecToMatrix` (inverts the quaternion first; row vectors, world = local × parent).
 Bone names resolve through the name tables in `qb.pre`. Pro skaters stand in a T-pose,
-1.83 m tall, facing +Z in THUG space.
+1.83 m tall, facing +Z in THUG space. A pro's look (`appearance_<name>` in
+`scripts/game/cas_skater_m.qb`) is the body skin alone, head included;
+`head_<name>.skin` is the matching created-skater head and must not be added on top.
+The importer re-aims only bones with a child, so the exporter re-poses the skater to
+the stock rig's A-pose first (head and hands keep their parent's rotation).

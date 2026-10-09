@@ -2,8 +2,9 @@
 engine's Custom Models importer (tools/mixamo_to_skate) can fit to the Skate 3 rig.
 
 usage: python thug_skater_to_glb.py <THUG Game folder> <skater, e.g. campbell> <out.glb>
+                                    [--reference <install>/assets/private/skater.glb]
 
-Reads Data/pre/skaterparts.pre (models/skater_male/skater_<name> and head_<name>) and
+Reads Data/pre/skaterparts.pre (models/skater_male/skater_<name>) and
 Data/pre/skeletons.pre (thps5_human). THUG bones are renamed to Mixamo names; helper
 bones (fingers, wrist, cloth, jaw...) fold into the nearest mapped bone. Only the bind
 pose is exported, no animation. See docs/thug/FORMATS.md.
@@ -72,6 +73,62 @@ def read_skeleton(data: bytes):
     return list(names), list(parents), np.array([m[3, :3] for m in world])
 
 
+# Parent -> the child whose direction aims each bone; bones without one keep their
+# parent's rotation (head with neck, hands with forearms, so they stay rigid and flat).
+AIM = {"Hips": "Spine", "Spine": "Spine1", "Spine1": "Spine2", "Spine2": "Neck", "Neck": "Head"}
+for _side in ("Left", "Right"):
+    AIM.update({f"{_side}Shoulder": f"{_side}Arm", f"{_side}Arm": f"{_side}ForeArm",
+                f"{_side}ForeArm": f"{_side}Hand", f"{_side}UpLeg": f"{_side}Leg",
+                f"{_side}Leg": f"{_side}Foot", f"{_side}Foot": f"{_side}ToeBase"})
+STOCK_NAME = {"Spine2": "SPINE3"}
+
+
+def stock_joints(path):
+    """World positions of the stock skater rig's joints (assets/private/skater.glb)."""
+    data = pathlib.Path(path).read_bytes()
+    n = struct.unpack_from("<I", data, 12)[0]
+    doc = json.loads(data[20:20 + n])
+    binary = data[20 + n + 8:]
+    skin = doc["skins"][0]
+    acc = doc["accessors"][skin["inverseBindMatrices"]]
+    view = doc["bufferViews"][acc["bufferView"]]
+    start = view.get("byteOffset", 0) + acc.get("byteOffset", 0)
+    ibm = np.frombuffer(binary[start:start + 64 * acc["count"]], np.float32).reshape(-1, 4, 4).transpose(0, 2, 1)
+    names = [doc["nodes"][j]["name"].upper() for j in skin["joints"]]
+    return {name: np.linalg.inv(m)[:3, 3] for name, m in zip(names, ibm)}
+
+
+def rotation_between(a, b):
+    a, b = a / np.linalg.norm(a), b / np.linalg.norm(b)
+    v, c = np.cross(a, b), np.dot(a, b)
+    if c < -0.999:
+        return -np.eye(3)
+    k = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + k + k @ k / (1 + c)
+
+
+def pose_like_stock(world, stock):
+    """Re-pose the THUG T-pose so every bone points the way the stock rig's does. The
+    importer only re-aims bones that have a child, so without this the head and hands
+    keep their T-pose angle while the neck and forearms move: the face slides off the
+    head and the hands stick out sideways. Returns per-bone rotation and new position."""
+    # Stock skater faces +Z with its left at +X; this export faces -Z with its left at -X.
+    flip = np.array([-1.0, 1.0, -1.0])
+    stock = {k: v * flip for k, v in stock.items()}
+    rot, posed = {}, {}
+    for mixamo, _, parent in MIXAMO:
+        r = rot[parent] if parent else np.eye(3)
+        posed[mixamo] = posed[parent] + rot[parent] @ (world[mixamo] - world[parent]) if parent else world[mixamo]
+        child = AIM.get(mixamo)
+        if child:
+            have = r @ (world[child] - world[mixamo])
+            name = lambda m: STOCK_NAME.get(m, m.upper())
+            want = stock[name(child)] - stock[name(mixamo)]
+            r = rotation_between(have, want) @ r
+        rot[mixamo] = r
+    return rot, posed
+
+
 def to_glb_space(p):
     p = np.asarray(p, np.float64) * INCH
     return p * np.array([1, 1, -1])  # THUG is left-handed
@@ -118,7 +175,7 @@ class Glb:
         pathlib.Path(path).write_bytes(out)
 
 
-def convert(game_dir: pathlib.Path, skater: str, out_path: pathlib.Path):
+def convert(game_dir: pathlib.Path, skater: str, out_path: pathlib.Path, reference=None, head=False):
     pre = game_dir / "Data" / "pre"
     parts = read_pre(pre / "skaterparts.pre")
     names, parents, positions = read_skeleton(read_pre(pre / "skeletons.pre")["skeletons/thps5_human.ske.xbx"])
@@ -136,11 +193,14 @@ def convert(game_dir: pathlib.Path, skater: str, out_path: pathlib.Path):
 
     g = Glb()
     joint_index = {}
-    world = {}
+    world = {m: to_glb_space(positions[by_crc[crc(thug)]]) for m, thug, _ in MIXAMO}
+    if reference:
+        rot, posed = pose_like_stock(world, stock_joints(reference))
+    else:
+        rot, posed = {m: np.eye(3) for m in world}, dict(world)
     for mixamo, thug, parent in MIXAMO:
-        pos = to_glb_space(positions[by_crc[crc(thug)]])
-        world[mixamo] = pos
-        local = pos - world[parent] if parent else pos
+        pos = posed[mixamo]
+        local = pos - posed[parent] if parent else pos
         g.doc["nodes"].append({"name": f"mixamorig:{mixamo}", "translation": local.tolist()})
         joint_index[mixamo] = len(g.doc["nodes"]) - 1
         if parent:
@@ -149,13 +209,16 @@ def convert(game_dir: pathlib.Path, skater: str, out_path: pathlib.Path):
     order = {m: k for k, (m, _, _) in enumerate(MIXAMO)}
     ibm = np.stack([np.eye(4) for _ in MIXAMO])
     for k, (m, _, _) in enumerate(MIXAMO):
-        ibm[k, :3, 3] = -world[m]
+        ibm[k, :3, 3] = -posed[m]
     g.doc["skins"].append({"joints": joints, "skeleton": joint_index["Hips"],
                            "inverseBindMatrices": g.accessor(ibm.transpose(0, 2, 1).reshape(-1, 16), "MAT4", 5126)})
 
     primitives, texture_slot = [], {}
     report = {"vertices": 0, "triangles": 0}
-    for part in (f"models/skater_male/skater_{skater}", f"models/skater_male/head_{skater}"):
+    # A pro's appearance is the body skin alone (it includes his own head);
+    # head_<name> is the CAS head for created skaters and would sit on top of it.
+    names_ = [f"models/skater_male/skater_{skater}"] + ([f"models/skater_male/head_{skater}"] if head else [])
+    for part in names_:
         if f"{part}.skin.xbx" not in parts:
             sys.exit(f"{part}.skin.xbx not found in skaterparts.pre")
         materials, sectors = thug_level.read_scn(parts[f"{part}.skin.xbx"])
@@ -178,6 +241,17 @@ def convert(game_dir: pathlib.Path, skater: str, out_path: pathlib.Path):
                 for k, (t, w) in enumerate(sorted(acc.items(), key=lambda x: -x[1])[:4]):
                     jw[v, k], ww[v, k] = order[t], w
             ww /= np.maximum(ww.sum(1, keepdims=True), 1e-9)
+            # Linear-blend the vertices into the re-posed bind pose.
+            new_pos, new_nrm = np.zeros_like(pos), np.zeros_like(nrm)
+            for k in range(4):
+                for b, (m, _, _) in enumerate(MIXAMO):
+                    sel = (jw[:, k] == b) & (ww[:, k] > 0)
+                    if sel.any():
+                        w = ww[sel, k][:, None]
+                        new_pos[sel] += w * ((pos[sel] - world[m]) @ rot[m].T + posed[m])
+                        new_nrm[sel] += w * (nrm[sel] @ rot[m].T)
+            pos = new_pos
+            nrm = new_nrm / np.maximum(np.linalg.norm(new_nrm, axis=1, keepdims=True), 1e-9)
             for mesh in sector.meshes:
                 tris = [t for t in strip_triangles(mesh.indices) if max(t) < len(pos)]
                 if not tris:
@@ -220,6 +294,13 @@ def convert(game_dir: pathlib.Path, skater: str, out_path: pathlib.Path):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        sys.exit(__doc__)
-    print(convert(pathlib.Path(sys.argv[1]), sys.argv[2], pathlib.Path(sys.argv[3])))
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("game_dir", type=pathlib.Path)
+    ap.add_argument("skater")
+    ap.add_argument("out", type=pathlib.Path)
+    ap.add_argument("--reference", type=pathlib.Path,
+                    help="your installation's assets/private/skater.glb: pre-poses the skater like the stock rig")
+    ap.add_argument("--head", action="store_true", help="also add head_<name> (CAS head; pros don't use it)")
+    a = ap.parse_args()
+    print(convert(a.game_dir, a.skater, a.out, a.reference, a.head))

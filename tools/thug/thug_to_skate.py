@@ -44,7 +44,8 @@ TERRAIN_AUDIO = {
 TERRAIN_WATER = 24
 PHYSICS_GROUND, PHYSICS_WATER = 1, 12
 
-FACE_NON_COLLIDABLE, FACE_TRIGGER = 0x10, 0x40
+FACE_NON_COLLIDABLE = 0x10
+PASS_ENVIRONMENT = 0x08  # sphere-mapped reflection pass; its texture is a sky, not a surface
 
 # THUG pass-0 blend modes (Gfx/XBox/NX/render.h). The engine's portable materials can't
 # alpha-blend (blended output is opaque), so BLEND becomes an alpha cutout. Additive,
@@ -134,6 +135,13 @@ def decode_texture(tex: thug_level.Texture) -> bytes:
 
 def texture_has_alpha(rgba: bytes) -> bool:
     return np.frombuffer(rgba, np.uint8)[3::4].min() < 250
+
+
+def texture_is_dark(rgba: bytes) -> bool:
+    """Shadow decals: near-black colour where the texture is visible."""
+    px = np.frombuffer(rgba, np.uint8).reshape(-1, 4).astype(np.float32)
+    w = px[:, 3] / 255
+    return w.sum() > 0 and (px[:, :3].mean(1) * w).sum() / w.sum() < 40
 
 
 # ---- geometry -------------------------------------------------------------------------------
@@ -276,12 +284,13 @@ def convert(game_dir: pathlib.Path, level: str, out_path: pathlib.Path, keep_wir
     collision = thug_level.read_col(files[f"{base}.col.xbx"])
 
     # Textures (1-based ids in .skate).
-    tex_id, tex_rgba, tex_alpha = {}, [], {}
+    tex_id, tex_rgba, tex_alpha, tex_dark = {}, [], {}, {}
     for t in textures:
         rgba = decode_texture(t)
         tex_id[t.checksum] = len(tex_rgba) + 1
         tex_rgba.append((f"{t.checksum:08x}", t.width, t.height, 1, rgba))
         tex_alpha[t.checksum] = texture_has_alpha(rgba)
+        tex_dark[t.checksum] = texture_is_dark(rgba)
 
     # Materials: one per THUG material, pass 0 only. Id 1 is a fallback for collision.
     # Every material but the collision one uses the baked vertex lighting (written as the
@@ -289,10 +298,15 @@ def convert(game_dir: pathlib.Path, level: str, out_path: pathlib.Path, keep_wir
     mat_id = {}
     mat_rows = [("thug_collision", 0, False, 0, 0.5)]
     for m in materials:
-        p0 = m.passes[0] if m.passes else None
+        # First pass that isn't an environment reflection (pool water, glass, chrome).
+        p0 = next((p for p in m.passes if not p.flags & PASS_ENVIRONMENT), None)
+        if m.passes and p0 is None:
+            continue
         blend = p0.blend & 0xFF if p0 else BLEND_DIFFUSE
         if blend in DROPPED_BLENDS:
             continue
+        if blend in (BLEND_BLEND, BLEND_BLEND_FIXED) and tex_dark.get(p0.texture):
+            continue  # baked shadow decal: comes out as hard black shapes as a cutout
         texture = tex_id.get(p0.texture, 0) if p0 else 0
         if blend in (BLEND_BLEND, BLEND_BLEND_FIXED) or tex_alpha.get(p0.texture if p0 else 0):
             alpha_mode, cutoff = 1, max(m.alpha_cutoff / 255.0, BLEND_CUTOFF if blend else 0.0) or BLEND_CUTOFF
@@ -367,7 +381,7 @@ def convert(game_dir: pathlib.Path, level: str, out_path: pathlib.Path, keep_wir
         if keep is not None and obj.checksum not in keep:
             continue
         for face in obj.faces:
-            if face.flags & (FACE_NON_COLLIDABLE | FACE_TRIGGER):
+            if face.flags & FACE_NON_COLLIDABLE:  # trigger faces (gaps, QPs) are still solid
                 continue
             a, b, c = (to_skate(v) for v in face.verts)
             a, b, c = a, c, b  # Z flip mirrors, so reverse winding

@@ -24,11 +24,11 @@ and pick it from the Escape menu.
 ## Skaters
 
 ```
-python tools/thug/thug_skater_to_glb.py "C:\Games\Tony Hawk's Underground\Game" campbell kareem_campbell.glb
+python tools/thug/thug_skater_to_glb.py "C:\Games\Tony Hawk's Underground\Game" campbell kareem_campbell.glb --reference "<install>\assets\private\skater.glb"
 ```
 
-Writes a skinned GLB with Mixamo bone names (body + head from `skaterparts.pre`, bind
-pose from `skeletons.pre`). Import it in game: Escape menu > Custom models > Import
+Writes a skinned GLB with Mixamo bone names (the pro's body skin from `skaterparts.pre`,
+skeleton from `skeletons.pre`), re-posed to match your stock skater rig. Import it in game: Escape menu > Custom models > Import
 model... The importer fits it to the Skate 3 rig. Names are the `skater_<name>` parts,
 e.g. campbell, hawk, muska, mullen, lasek.
 
