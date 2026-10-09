@@ -14,4 +14,8 @@ What converts today: render geometry (first texture pass), textures, collision w
 terrain types mapped to Skate 3 rolling-sound surfaces, rails, and the Player 1 restart
 as the spawn. Not yet: ladders, ledges, baked lighting, multi-pass materials.
 
+To play a converted map in the release build, put the `.skate` file in
+`<install>\data\installations\<id>\maps\` (the folder beside the installation's assets)
+and pick it from the Escape menu.
+
 Format notes: [docs/thug/FORMATS.md](../../docs/thug/FORMATS.md).
