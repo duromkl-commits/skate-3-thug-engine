@@ -187,3 +187,17 @@ TerrainType...) belong to the node. On NJ: 1783 RailNode, 167 ClimbingNode
   unless `--keep-wires`.
 - Sky: `levels/<l>_sky/<l>_sky.scn.xbx` is exported as a static dome scaled to a
   650 m radius around the level centre (the engine's own sky is a flat clear colour).
+
+## Skaters (`skaterparts.pre`, `skeletons.pre`)
+
+`models/skater_male/skater_<name>.skin.xbx` and `head_<name>.skin.xbx` are ordinary
+`.scn.xbx` scenes whose sectors carry flag 0x10: per vertex a u32 of packed weights
+(11:11:10 bits, /1023, /1023, /511) and u16 bone indices[4] (first three used).
+Positions are model space in the bind pose. Textures are in the matching `.tex.xbx`.
+
+`skeletons/thps5_human.ske.xbx` (Gfx/Skeleton.cpp): `i32 version (2), u32 flags,
+i32 n, u32 bone names[n], u32 parent names[n], u32 flip names[n]`, then per bone a
+quaternion (xyzw) and a translation (xyzw) relative to the parent. Quat→matrix is
+`QuatVecToMatrix` (inverts the quaternion first; row vectors, world = local × parent).
+Bone names resolve through the name tables in `qb.pre`. Pro skaters stand in a T-pose,
+1.83 m tall, facing +Z in THUG space.

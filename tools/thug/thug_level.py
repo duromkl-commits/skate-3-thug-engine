@@ -92,6 +92,7 @@ class Sector:
     normals: list | None
     uvs: list | None  # per vertex, list of (u, v) per texture set
     colors: list | None  # ARGB u32, baked lighting
+    weights: list | None = None  # per vertex: up to 3 (bone index, weight); skinned meshes only
     meshes: list = field(default_factory=list)
 
 
@@ -132,8 +133,14 @@ def _read_sector(r: Reader) -> Sector:
     n, _stride = r.take("ii")
     pos = [r.take("3f") for _ in range(n)]
     normals = [r.take("3f") for _ in range(n)] if flags & 0x04 else None
-    if flags & 0x10:
-        r.bytes(n * 4 + n * 8)  # weights, bone indices
+    weights = None
+    if flags & 0x10:  # u32 packed weights (11:11:10), u16 bone indices[4]
+        packed = r.take(f"{n}I")
+        bones = r.take(f"{n * 4}H")
+        weights = []
+        for v, w in enumerate(packed):
+            ws = ((w & 0x7FF) / 1023.0, ((w >> 11) & 0x7FF) / 1023.0, ((w >> 22) & 0x3FF) / 511.0)
+            weights.append([(bones[v * 4 + k], ws[k]) for k in range(3) if ws[k] > 0])
     uvs = None
     if flags & 0x01:
         sets = r.one("i")
@@ -142,7 +149,7 @@ def _read_sector(r: Reader) -> Sector:
     colors = list(r.take(f"{n}I")) if flags & 0x02 else None
     if flags & 0x800:
         r.bytes(n)
-    sector = Sector(cs, flags, pos, normals, uvs, colors)
+    sector = Sector(cs, flags, pos, normals, uvs, colors, weights=weights)
     for _ in range(num_mesh):
         r.take("3ff3f3f")  # centre, radius, bbox
         mflags, material, lods = r.take("III")
