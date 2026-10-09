@@ -152,12 +152,26 @@ and get the closest match.
 Physics type: 1 (ordinary ground) everywhere except water (12). Other values
 (6 unrideable, 7 don't-align, 8 …) exist in the engine but aren't mapped yet.
 
+## Level scripts (`<level>.qb`, Gel/Scripting/tokens.h, skiptoken.cpp)
+
+Compiled QB is a token stream: 1-byte token, then operands. Name, integer, float,
+line number, jump: 4 bytes. Vector: 12 bytes, pair: 8, string: u32 length + bytes.
+A trailing table of `CHECKSUM_NAME` tokens (0x2B: u32 checksum + C string) names
+most checksums. Checksums are Neversoft CRC32: lower-cased, `/` to `\`, init
+0xFFFFFFFF, **no final xor**.
+
+`NodeArray` is an array of structs. Most nodes are compressed: a bare flag such
+as `ncomp_Waypoint_3239` names a global struct whose fields (Class, Type,
+TerrainType...) belong to the node. On NJ: 1783 RailNode, 167 ClimbingNode
+(155 Ledge, 12 Ladder), 14 Restart (one `Type = Player1`). Rails are chains through
+`Links` (node indices), giving 284 rails on NJ. `thug_qb.py` reads it.
+
 ## Still to work out
 
 - In-game check of orientation (Z is negated, winding reversed; collision floors
   come out facing up) and texture V direction.
 - Face flags on PC: almost every face carries 0x2000; 0x1 (skatable) is unused.
-- Rails, ladders, ledge hang points and spawns live in the level's compiled
-  `.qb` node array, so we need a QB reader (Gel/Scripting has the loader).
+- Ladders and ledge hang points (ClimbingNode) aren't exported yet.
+- Spawn heading is the restart's yaw negated for the Z flip; check in-game.
 - Baked vertex colours → `.skate` has an indirect/lightmap texture slot. For the
   first pass, bake vertex colour into albedo or skip it. Plan to re-light later.

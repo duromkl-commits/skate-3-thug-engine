@@ -3,9 +3,10 @@
 usage: python thug_to_skate.py <THUG Game folder> <level, e.g. NJ> <out.skate>
 
 Reads Data/pre/<level>scn.pre and <level>col.pre from your own THUG PC install.
-What carries over: render geometry (pass 0 texture), textures, collision with THUG
-terrain types mapped to Skate 3 audio surfaces. Not yet: rails, ladders, ledges,
-spawns, baked vertex lighting, multi-pass blending. See docs/thug/FORMATS.md.
+and <level>.pre (the level's node array). What carries over: render geometry (pass 0
+texture), textures, collision with THUG terrain types mapped to Skate 3 audio surfaces,
+rails (RailNode chains) and the Player1 restart as the spawn. Not yet: ladders, ledges,
+baked vertex lighting, multi-pass blending. See docs/thug/FORMATS.md.
 """
 import math
 import pathlib
@@ -18,6 +19,7 @@ import numpy as np
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import thug_level  # noqa: E402
 from thug_pre import read_pre  # noqa: E402
+from thug_qb import crc, expand_nodes, read_qb  # noqa: E402
 
 INCH = 0.0254
 
@@ -253,14 +255,21 @@ def convert(game_dir: pathlib.Path, level: str, out_path: pathlib.Path):
                 continue
             coll.append((a, b, c, surface_tag(face.terrain)))
 
-    spawn = spawn_guess(coll)
+    nodes = []
+    if (pre_dir / f"{level}.pre").exists():
+        level_files = read_pre(pre_dir / f"{level}.pre")
+        if f"{base}.qb" in level_files:
+            globals_, _ = read_qb(level_files[f"{base}.qb"])
+            nodes = expand_nodes(globals_.get(crc("NodeArray"), []), globals_)
+    rails = read_rails(nodes)
+    spawn, heading = read_spawn(nodes) or (spawn_guess(coll), 0.0)
 
     out = Out()
     out.u(0x12345678)
     out.s(f"THUG {level}")
-    out.f(*spawn, 0.0)
+    out.f(*spawn, heading)
     out.f(*ENVIRONMENT)
-    out.u(len(mat_rows), len(tex_rgba), len(verts), len(indices), len(coll), 0, 0, 0, 0)
+    out.u(len(mat_rows), len(tex_rgba), len(verts), len(indices), len(coll), len(rails), 0, 0, 0)
     for name, texture, alpha_mode, cutoff in mat_rows:
         out.s(name)
         out.u(1)
@@ -283,9 +292,55 @@ def convert(game_dir: pathlib.Path, level: str, out_path: pathlib.Path):
     for a, b, c, tag in coll:
         cbytes += struct.pack("<9fII", *a, *b, *c, tag, 1)
     out.block(bytes(cbytes))
+    for name, closed, points in rails:
+        out.s(name)
+        out.u(int(closed), len(points))
+        for p in points:
+            out.f(*p)
     out_path.write_bytes(out.b)
     return dict(textures=len(tex_rgba), materials=len(mat_rows), vertices=len(verts),
-                triangles=len(indices) // 3, collision=len(coll), spawn=spawn, bytes=len(out.b))
+                triangles=len(indices) // 3, collision=len(coll), rails=len(rails),
+                spawn=spawn, heading=heading, bytes=len(out.b))
+
+
+CLASS, POS, ANGLES, LINKS, NAME, TYPE = (crc(n) for n in ("Class", "Pos", "Angles", "Links", "Name", "Type"))
+
+
+def read_rails(nodes):
+    """RailNode chains (Links point at the next node) -> [(name, closed, points in metres)]."""
+    rail = {i for i, n in enumerate(nodes) if n.get(CLASS) == crc("RailNode") and POS in n}
+    nxt = {}
+    for i in rail:
+        links = [j for j in nodes[i].get(LINKS, []) if isinstance(j, int) and j in rail]
+        if links:
+            nxt[i] = links[0]
+    has_prev = set(nxt.values())
+    out, seen = [], set()
+    starts = [i for i in sorted(rail) if i not in has_prev] + sorted(rail)  # loops have no start
+    for start in starts:
+        if start in seen:
+            continue
+        chain, i = [], start
+        while i is not None and i not in seen:
+            seen.add(i)
+            chain.append(i)
+            i = nxt.get(i)
+        closed = i == start and len(chain) > 2
+        if len(chain) >= 2:
+            out.append((f"rail_{start}", closed, [to_skate(nodes[j][POS]) for j in chain]))
+    return out
+
+
+def read_spawn(nodes):
+    """The Player1 restart (else the first restart): position in metres and heading."""
+    restarts = [n for n in nodes if n.get(CLASS) == crc("Restart") and POS in n]
+    if not restarts:
+        return None
+    player1 = [n for n in restarts if n.get(TYPE) == crc("Player1")]
+    node = (player1 or restarts)[0]
+    yaw = node.get(ANGLES, (0, 0, 0))[1]
+    x, y, z = to_skate(node[POS])
+    return (x, y + 0.3, z), -yaw  # lift off the floor; Z flip mirrors the yaw
 
 
 def spawn_guess(coll):

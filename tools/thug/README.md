@@ -11,7 +11,7 @@ python tools/thug/thug_to_skate.py "C:\Games\Tony Hawk's Underground\Game" NJ ma
 Level names are the `Data/pre/<NAME>scn.pre` prefixes: NJ, NY, FL, SD, HI, VC, SJ, RU, SE, VN, HN, SC, SC2, PH, DJ, ...
 
 What converts today: render geometry (first texture pass), textures, collision with THUG
-terrain types mapped to Skate 3 rolling-sound surfaces. Not yet: rails, ladders, ledges,
-spawn points (a large flat floor is used), baked lighting, multi-pass materials.
+terrain types mapped to Skate 3 rolling-sound surfaces, rails, and the Player 1 restart
+as the spawn. Not yet: ladders, ledges, baked lighting, multi-pass materials.
 
 Format notes: [docs/thug/FORMATS.md](../../docs/thug/FORMATS.md).
